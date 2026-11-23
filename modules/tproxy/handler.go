@@ -21,16 +21,60 @@ import (
 	"github.com/love4taylor/caddy-tproxy/internal/server"
 )
 
-// Handler embeds the Telegram WEB relay and its MTProxy backend in Caddy.
+// Handler serves Telegram's WEB Proxy protocol on a Caddy HTTPS site.
+// It runs the WEB relay and its MTProxy backend in the Caddy process and
+// passes ordinary website requests to the next handler.
+//
+// Configure a single client secret with `secret_file`, or use `profiles`
+// to offer distinct secrets, transports, and limits on the same hostname.
+// In Telegram, choose WEB Proxy and enter the public hostname, any configured
+// base path, and the client secret for the desired profile.
+//
+// See the [Caddyfile examples and deployment guide](https://github.com/love4taylor/caddy-tproxy#quick-start).
 type Handler struct {
-	Hostname       string         `json:"hostname"`
-	SecretFile     string         `json:"secret_file,omitempty"`
-	Carrier        string         `json:"carrier,omitempty"`
-	Profiles       []Profile      `json:"profiles,omitempty"`
-	PublicIP       string         `json:"public_ip,omitempty"`
-	BasePath       string         `json:"base_path,omitempty"`
-	TokenKeyFile   string         `json:"token_key_file,omitempty"`
-	Limits         map[string]int `json:"limits,omitempty"`
+	// Required public DNS hostname that Telegram clients use to reach the relay.
+	// Use a fully qualified, lowercase ASCII name such as `proxy.example.com`.
+	Hostname string `json:"hostname"`
+
+	// Path to the client secret file for a single profile. The file must be a
+	// regular file readable by Caddy with owner-only permissions such as `0600`.
+	// It contains a 16-byte MTProxy key encoded as hex or Base64URL, with an
+	// optional leading `0xdd` byte before encoding. Required when `profiles` is empty.
+	SecretFile string `json:"secret_file,omitempty"`
+
+	// Transport for the profile configured with the top-level `secret_file`.
+	// Use `https` (default), `https-lanes`, `websocket`, or `websocket-lanes`.
+	Carrier string `json:"carrier,omitempty"`
+
+	// Client profiles with distinct secrets and optional transport and limit
+	// settings. Configure these in place of the top-level `secret_file` and `carrier`.
+	// The number of profiles is capped by `limits.max_profiles` (default `32`).
+	Profiles []Profile `json:"profiles,omitempty"`
+
+	// Public IPv4 address that Telegram sees for outbound MTProxy connections.
+	// Set this to the translated source address when Caddy connects through NAT.
+	// If omitted, the MTProxy backend uses the connection's local IPv4 address.
+	PublicIP string `json:"public_ip,omitempty"`
+
+	// URL path prefix for the relay, such as `/telegram`. Defaults to the site
+	// root. Include the prefix in the Telegram server field as `proxy.example.com/telegram`.
+	BasePath string `json:"base_path,omitempty"`
+
+	// Path to an exactly 32-byte binary signing key for relay tokens. The file
+	// must be a regular file readable by Caddy with owner-only permissions.
+	// If omitted, the module generates and persists a key in Caddy storage for
+	// each hostname and base path combination.
+	TokenKeyFile string `json:"token_key_file,omitempty"`
+
+	// Limit overrides for this handler. Use lowercase keys and integer values,
+	// with sizes in bytes. Omitted keys retain their defaults. All profiles share
+	// the handler-wide quotas, including `max_sessions_global` and `max_streams_global`.
+	// Set the request header limit through Caddy's `servers` option `max_header_size`.
+	Limits map[string]int `json:"limits,omitempty"`
+
+	// How long an inactive relay session without an attached transport is kept
+	// for reconnection. Use a duration string such as `2m` or an integer in
+	// nanoseconds. Defaults to `2m` when omitted or zero.
 	ReconnectGrace caddy.Duration `json:"reconnect_grace,omitempty"`
 
 	relay       *server.Server
@@ -39,11 +83,25 @@ type Handler struct {
 	replayKeys  [][16]byte
 }
 
+// Profile configures a client secret and its transport and limits.
 type Profile struct {
-	Name       string         `json:"name"`
-	SecretFile string         `json:"secret_file"`
-	Carrier    string         `json:"carrier,omitempty"`
-	Limits     map[string]int `json:"limits,omitempty"`
+	// Required profile name. It must be unique within the handler and contain
+	// 1 to 64 bytes.
+	Name string `json:"name"`
+
+	// Required client secret file. It uses the same format and permissions as
+	// the top-level `secret_file`. Each profile must use a distinct MTProxy key.
+	SecretFile string `json:"secret_file"`
+
+	// Transport for this profile. Use `https` (default), `https-lanes`,
+	// `websocket`, or `websocket-lanes`.
+	Carrier string `json:"carrier,omitempty"`
+
+	// Per-profile limits such as `max_sessions` and `max_streams`. Use lowercase
+	// keys and integer values, with sizes in bytes. Omitted or zero values use
+	// defaults derived from the handler's limits. Positive overrides must fit
+	// within the corresponding handler limits.
+	Limits map[string]int `json:"limits,omitempty"`
 }
 
 func init() {
