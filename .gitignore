@@ -1,0 +1,33 @@
+# Build and test output
+/.build/
+/dist/
+/caddy
+/caddy.exe
+*.test
+*.test.exe
+/coverage.out
+/coverage.html
+/*.prof
+*.log
+
+# Local Caddy configuration and secrets
+/Caddyfile
+/Caddyfile.local
+/caddy.json
+/.env
+/.env.*
+!/.env.example
+*.secret
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Local tools and editors
+/.agents/
+/.aws/
+/.codex/
+/.codegraph/
+/.idea/
+/.vscode/
+.DS_Store
