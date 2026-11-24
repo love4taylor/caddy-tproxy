@@ -17,14 +17,16 @@ func init() {
 
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	handler := new(Handler)
-	err := handler.UnmarshalCaddyfile(h.Dispenser)
-	return handler, err
+	return handler, handler.UnmarshalCaddyfile(h.Dispenser)
 }
 
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next()
-	if !d.AllArgs(&h.Hostname) {
-		return d.ArgErr()
+	if d.NextArg() {
+		h.Hostname = d.Val()
+		if h.Hostname == "" || d.NextArg() {
+			return d.ArgErr()
+		}
 	}
 	fields := map[string]*string{
 		"secret_file":    &h.SecretFile,

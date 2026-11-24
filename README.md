@@ -29,7 +29,7 @@ Add `tproxy` to the HTTPS site. The example uses a simple response for ordinary 
 
 ```caddyfile
 proxy.example.com {
-	tproxy proxy.example.com {
+	tproxy {
 		secret_file /etc/caddy/tproxy.secret
 	}
 
@@ -52,14 +52,16 @@ tg://webproxy?server=proxy.example.com&secret=<hex-secret>
 
 ## Configuration
 
-The hostname after `tproxy` is the public DNS name clients use. Configure either a single `secret_file` or one or more `profile` entries.
+By default, `tproxy` serves every concrete DNS hostname matched by the site and the directive's route. Use `tproxy <hostname>` to restrict the relay to one public hostname. Configure either a single `secret_file` or one or more `profile` entries.
+
+Native Caddy JSON follows the same rule using the enclosing routes' `host` matchers. Specify a hostname explicitly for named routes, error routes, and routes with no concrete DNS names, such as wildcard-only or port-only sites.
 
 | Option | Meaning |
 | --- | --- |
 | `secret_file <path>` | Path to a regular file readable by Caddy with owner-only permissions, such as `0600` or `0400`. Accepts a 16-byte key in hex or Base64URL, with an optional `dd` prefix in the decoded bytes. |
 | `carrier <mode>` | Transport in single-key mode. Choices are `https` (default), `https-lanes`, `websocket`, and `websocket-lanes`. |
 | `profile <name> <secret-file> [<carrier>]` | Repeatable entry with a distinct key, an optional carrier and optional per-profile limits. Use these entries in place of the top-level `secret_file` and `carrier`. |
-| `limits { … }` | Limits for this module instance. Use integers and specify sizes in bytes. Profiles inherit omitted limits and share the instance-wide quotas. See the [upstream capacity reference](https://github.com/telegramdesktop/tproxy-server/blob/c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8/README.md#capacity-limits). |
+| `limits { … }` | Limits apply separately to each served hostname. Use integers and specify sizes in bytes. Profiles inherit omitted limits and share the quotas for their hostname. See the [upstream capacity reference](https://github.com/telegramdesktop/tproxy-server/blob/c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8/README.md#capacity-limits). |
 | `base_path <path>` | Mount the relay under a path such as `/telegram`. Enter `proxy.example.com/telegram` in the client. The default is the site root. |
 | `public_ip <IPv4>` | If Caddy connects through NAT, set this to the public IPv4 address Telegram sees. You can omit it when the host connects directly from its public IPv4 address. |
 | `token_key_file <path>` | Optional 32-byte binary signing key. By default, Caddy storage holds a generated key for each hostname and base path. Use the client secret when configuring Telegram. |
@@ -79,7 +81,7 @@ Use profiles to offer different transports on the same hostname. Each client use
 
 ```caddyfile
 proxy.example.com {
-	tproxy proxy.example.com {
+	tproxy {
 		limits {
 			max_sessions_global 64
 			max_streams_global 1024

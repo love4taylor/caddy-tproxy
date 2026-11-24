@@ -6,7 +6,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/love4taylor/caddy-tproxy/internal/server"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -70,10 +69,11 @@ type tproxyCollector []tproxyMetric
 
 var metricsInstance atomic.Uint64
 
-func (h *Handler) registerMetrics(registry *prometheus.Registry, relay *server.Server, backend *backend, base string) error {
+func (site *hostRelay) registerMetrics(registry *prometheus.Registry, hostname, base string) error {
+	relay, backend := site.relay, site.backend
 	// Instances with the same site scope can appear in separate Caddy routes.
 	labels := prometheus.Labels{
-		"hostname": h.Hostname, "base_path": base,
+		"hostname": hostname, "base_path": base,
 		"instance": strconv.FormatUint(metricsInstance.Add(1), 10),
 	}
 	var collector tproxyCollector
@@ -120,7 +120,7 @@ func (h *Handler) registerMetrics(registry *prometheus.Registry, relay *server.S
 	if err := registry.Register(collector); err != nil {
 		return err
 	}
-	h.stopMetrics = func() {
+	site.stopMetrics = func() {
 		registry.Unregister(collector)
 	}
 	return nil

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,9 +33,11 @@ import (
 //
 // See the [Caddyfile examples and deployment guide](https://github.com/love4taylor/caddy-tproxy#quick-start).
 type Handler struct {
-	// Required public DNS hostname that Telegram clients use to reach the relay.
-	// Use a fully qualified, lowercase ASCII name such as `proxy.example.com`.
-	Hostname string `json:"hostname"`
+	// Restrict the relay to one public DNS hostname. Use a fully qualified,
+	// lowercase ASCII name such as `proxy.example.com`. When omitted, the relay
+	// serves each concrete DNS hostname configured on the route or its enclosing
+	// routes. Set this explicitly when the routes have no concrete DNS names.
+	Hostname string `json:"hostname,omitempty"`
 
 	// Path to the client secret file for a single profile. The file must be a
 	// regular file readable by Caddy with owner-only permissions such as `0600`.
@@ -67,8 +70,8 @@ type Handler struct {
 	TokenKeyFile string `json:"token_key_file,omitempty"`
 
 	// Limit overrides for this handler. Use lowercase keys and integer values,
-	// with sizes in bytes. Omitted keys retain their defaults. All profiles share
-	// the handler-wide quotas, including `max_sessions_global` and `max_streams_global`.
+	// with sizes in bytes. Omitted keys retain their defaults. All profiles on a
+	// hostname share its quotas, including `max_sessions_global` and `max_streams_global`.
 	// Set the request header limit through Caddy's `servers` option `max_header_size`.
 	Limits map[string]int `json:"limits,omitempty"`
 
@@ -77,6 +80,10 @@ type Handler struct {
 	// nanoseconds. Defaults to `2m` when omitted or zero.
 	ReconnectGrace caddy.Duration `json:"reconnect_grace,omitempty"`
 
+	hosts map[string]*hostRelay
+}
+
+type hostRelay struct {
 	relay       *server.Server
 	backend     *backend
 	stopMetrics func()
@@ -119,12 +126,17 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if fips140.Enforced() {
 		return errors.New("tproxy cannot run under strict FIPS 140 enforcement because Telegram RPC requires MD5 and SHA-1")
 	}
-	value := config.Defaults()
-	value.PublicHostname = h.Hostname
-	value.BasePath = strings.TrimPrefix(h.BasePath, "/")
-	if err := config.ValidateHostname(value.PublicHostname); err != nil {
+	hostnames := []string{h.Hostname}
+	if h.Hostname == "" {
+		hostnames = inferRouteHostnames(ctx)
+		if len(hostnames) == 0 {
+			return errors.New("tproxy requires an explicit hostname when its route has no concrete DNS hostname")
+		}
+	} else if err := config.ValidateHostname(h.Hostname); err != nil {
 		return fmt.Errorf("tproxy hostname: %w", err)
 	}
+	value := config.Defaults()
+	value.BasePath = strings.TrimPrefix(h.BasePath, "/")
 	if err := config.ValidateBasePath(value.BasePath); err != nil {
 		return fmt.Errorf("tproxy base_path: %w", err)
 	}
@@ -143,60 +155,82 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.ReconnectGrace != 0 {
 		value.Timeouts.ReconnectGrace = time.Duration(h.ReconnectGrace)
 	}
-	secrets, err := h.loadProfiles(&value)
-	if err != nil {
-		return err
-	}
-
-	key, err := h.signingKey(ctx, value.Base())
-	if err != nil {
-		return fmt.Errorf("tproxy signing key: %w", err)
-	}
-
 	var publicIP netip.Addr
 	if h.PublicIP != "" {
+		var err error
 		publicIP, err = netip.ParseAddr(h.PublicIP)
 		if err != nil || !publicIPv4(publicIP) {
 			return errors.New("tproxy public_ip must be a public IPv4 address")
 		}
 	}
-	backend := newBackend(ctx, publicIP, ctx.Logger().Named("mtproxy"))
-	replayKeys := make([][16]byte, 0, len(secrets))
+	secrets, err := h.loadProfiles(&value)
+	if err != nil {
+		return err
+	}
 	defer func() {
-		for _, secret := range replayKeys {
-			_, _ = handshakeWindows.Delete(secret)
+		for _, secret := range secrets {
+			clear(secret)
 		}
 	}()
-	for i := range value.Profiles {
-		profile := &value.Profiles[i]
-		secret := secrets[profile.Name]
-		window, _ := handshakeWindows.LoadOrStore(secret, new(handshakeReplays))
-		replays := window.(*handshakeReplays)
-		replayKeys = append(replayKeys, secret)
-		profile.DialBackend = func(ctx context.Context, ready func(error)) (net.Conn, error) {
-			return backend.dial(ctx, secret, replays, ready)
+	h.hosts = make(map[string]*hostRelay, len(hostnames))
+	for _, hostname := range hostnames {
+		value.PublicHostname = hostname
+		relay, err := h.provisionHost(ctx, value, publicIP, secrets)
+		if err != nil {
+			_ = h.Cleanup()
+			h.hosts = nil
+			return fmt.Errorf("tproxy %s: %w", hostname, err)
 		}
+		h.hosts[hostname] = relay
 	}
-	relay, err := server.NewEmbedded(value, key, clientIP)
-	if err != nil {
-		backend.close()
-		return fmt.Errorf("tproxy relay: %w", err)
+	for _, site := range h.hosts {
+		site.backend.start(ctx)
 	}
-	backend.buffer.shared = relay.ChangeBufferBudget
-	backend.maxDials = min(defaultMiddleDials, value.Limits.MaxBackendDialsInFlight)
-	if err := h.registerMetrics(ctx.GetMetricsRegistry(), relay, backend, value.Base()); err != nil {
-		relay.Shutdown()
-		backend.close()
-		return fmt.Errorf("tproxy metrics: %w", err)
-	}
-	backend.start(ctx)
-	h.backend, h.relay = backend, relay
-	h.replayKeys, replayKeys = replayKeys, nil
 	return nil
 }
 
+func (h *Handler) provisionHost(ctx caddy.Context, value config.Config, publicIP netip.Addr, secrets map[string][]byte) (_ *hostRelay, err error) {
+	key, err := h.signingKey(ctx, value.PublicHostname, value.Base())
+	if err != nil {
+		return nil, fmt.Errorf("tproxy signing key: %w", err)
+	}
+	site := &hostRelay{
+		backend:    newBackend(ctx, publicIP, ctx.Logger().Named("mtproxy")),
+		replayKeys: make([][16]byte, 0, len(secrets)),
+	}
+	defer func() {
+		if err != nil {
+			site.cleanup()
+		}
+	}()
+	value.Profiles = slices.Clone(value.Profiles)
+	for i := range value.Profiles {
+		profile := &value.Profiles[i]
+		rawSecret := secrets[profile.Name]
+		profile.Capability = config.DeriveCapability(value.PublicHostname, value.BasePath, rawSecret)
+		secret := [16]byte(rawSecret[len(rawSecret)-16:])
+		window, _ := handshakeWindows.LoadOrStore(secret, new(handshakeReplays))
+		replays := window.(*handshakeReplays)
+		site.replayKeys = append(site.replayKeys, secret)
+		profile.DialBackend = func(ctx context.Context, ready func(error)) (net.Conn, error) {
+			return site.backend.dial(ctx, secret, replays, ready)
+		}
+	}
+	site.relay, err = server.NewEmbedded(value, key, clientIP)
+	if err != nil {
+		return nil, fmt.Errorf("tproxy relay: %w", err)
+	}
+	site.backend.buffer.shared = site.relay.ChangeBufferBudget
+	site.backend.maxDials = min(defaultMiddleDials, value.Limits.MaxBackendDialsInFlight)
+	if err := site.registerMetrics(ctx.GetMetricsRegistry(), value.PublicHostname, value.Base()); err != nil {
+		return nil, fmt.Errorf("tproxy metrics: %w", err)
+	}
+	return site, nil
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if !h.relay.ClaimsRequest(r) {
+	relay := h.claimedRelay(r)
+	if relay == nil {
 		return next.ServeHTTP(w, r)
 	}
 	// The URI and WebSocket subprotocol can contain reusable credentials.
@@ -212,28 +246,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		w.WriteHeader(http.StatusTooEarly)
 		return nil
 	}
-	h.relay.ServeClaimed(w, r)
+	relay.ServeClaimed(w, r)
+	return nil
+}
+
+func (h *Handler) claimedRelay(r *http.Request) *server.Server {
+	current := h.hosts[strings.TrimSuffix(r.Host, ":443")]
+	if current != nil && current.relay.ClaimsRequest(r) {
+		return current.relay
+	}
+	// Route credentials sent to the wrong host to the relay's rejection path
+	// so they cannot reach another handler or the access log.
+	for _, site := range h.hosts {
+		if site != current && site.relay.ClaimsRequest(r) {
+			return site.relay
+		}
+	}
 	return nil
 }
 
 func (h *Handler) Cleanup() error {
-	if h.stopMetrics != nil {
-		h.stopMetrics()
+	for _, site := range h.hosts {
+		site.cleanup()
 	}
-	if h.relay != nil {
-		h.relay.Shutdown()
-	}
-	if h.backend != nil {
-		h.backend.close()
-	}
-	for _, secret := range h.replayKeys {
-		_, _ = handshakeWindows.Delete(secret)
-	}
-	h.replayKeys = nil
 	return nil
 }
 
-func (h *Handler) loadProfiles(value *config.Config) (map[string][16]byte, error) {
+func (site *hostRelay) cleanup() {
+	if site.stopMetrics != nil {
+		site.stopMetrics()
+	}
+	if site.relay != nil {
+		site.relay.Shutdown()
+	}
+	site.backend.close()
+	for _, secret := range site.replayKeys {
+		_, _ = handshakeWindows.Delete(secret)
+	}
+	site.replayKeys = nil
+}
+
+func (h *Handler) loadProfiles(value *config.Config) (_ map[string][]byte, err error) {
 	profiles := h.Profiles
 	switch {
 	case len(profiles) == 0 && h.SecretFile != "":
@@ -246,7 +299,14 @@ func (h *Handler) loadProfiles(value *config.Config) (map[string][16]byte, error
 		return nil, fmt.Errorf("tproxy supports up to %d profiles", value.Limits.MaxProfiles)
 	}
 
-	secrets := make(map[string][16]byte, len(profiles))
+	secrets := make(map[string][]byte, len(profiles))
+	defer func() {
+		if err != nil {
+			for _, secret := range secrets {
+				clear(secret)
+			}
+		}
+	}()
 	keys := make(map[[16]byte]struct{}, len(profiles))
 	for _, profile := range profiles {
 		if len(profile.Name) == 0 || len(profile.Name) > 64 {
@@ -270,19 +330,16 @@ func (h *Handler) loadProfiles(value *config.Config) (map[string][16]byte, error
 		if err != nil {
 			return nil, fmt.Errorf("tproxy profile %q secret_file: %w", profile.Name, err)
 		}
-		var key [16]byte
-		copy(key[:], secret[len(secret)-len(key):])
-		capability := config.DeriveCapability(value.PublicHostname, value.BasePath, secret)
-		clear(secret)
+		key := [16]byte(secret[len(secret)-16:])
 		if _, exists := keys[key]; exists {
+			clear(secret)
 			return nil, fmt.Errorf("tproxy profile %q reuses an MTProxy secret", profile.Name)
 		}
 		keys[key] = struct{}{}
-		secrets[profile.Name] = key
+		secrets[profile.Name] = secret
 		value.Profiles = append(value.Profiles, config.Profile{
 			Name:        profile.Name,
 			CarrierMode: carrier,
-			Capability:  capability,
 			Limits:      limits.WithDefaults(value.Limits),
 		})
 	}
@@ -307,13 +364,13 @@ func applyLimitOverrides(overrides map[string]int, limits any) error {
 	return decoder.Decode(limits)
 }
 
-func (h *Handler) signingKey(ctx caddy.Context, base string) (key [sha256.Size]byte, err error) {
+func (h *Handler) signingKey(ctx caddy.Context, hostname, base string) (key [sha256.Size]byte, err error) {
 	if h.TokenKeyFile != "" {
 		return config.ReadTokenKey(h.TokenKeyFile)
 	}
 	storage := ctx.Storage()
 	// Hash the scope so host and base path form a single storage key.
-	scope := sha256.Sum256([]byte(h.Hostname + "\n" + base))
+	scope := sha256.Sum256([]byte(hostname + "\n" + base))
 	path := fmt.Sprintf("tproxy/token_keys/%x", scope)
 	lock := fmt.Sprintf("tproxy-token-%x", scope)
 	lockCtx, cancel := context.WithTimeout(ctx, 15*time.Second)

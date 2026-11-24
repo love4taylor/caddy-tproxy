@@ -29,7 +29,7 @@ openssl rand -hex 16 > /etc/caddy/tproxy.secret
 
 ```caddyfile
 proxy.example.com {
-	tproxy proxy.example.com {
+	tproxy {
 		secret_file /etc/caddy/tproxy.secret
 	}
 
@@ -52,14 +52,16 @@ tg://webproxy?server=proxy.example.com&secret=<hex-secret>
 
 ## 配置
 
-`tproxy` 后面的域名是客户端访问的公开 DNS 名称。可以配置一个 `secret_file`，也可以配置一个或多个 `profile`。
+`tproxy` 默认在站点及指令路由匹配的每个具体域名上提供代理。用 `tproxy <hostname>` 可将代理限制在一个公开域名。可以配置一个 `secret_file`，也可以配置一个或多个 `profile`。
+
+原生 Caddy JSON 按相同规则从所在路由及外层路由的 `host` 匹配器取域名。命名路由、错误路由，以及只有通配符或端口等无法确定具体域名的路由，需要显式填写 `hostname`。
 
 | 配置项 | 含义 |
 | --- | --- |
 | `secret_file <path>` | Caddy 可读的普通文件，仅所有者可访问，例如权限为 `0600` 或 `0400`。支持十六进制或 Base64URL 编码的 16 字节密钥，解码后的字节可带 `dd` 前缀。 |
 | `carrier <mode>` | 单密钥模式下的传输方式。可选 `https`（默认）、`https-lanes`、`websocket` 和 `websocket-lanes`。 |
 | `profile <name> <secret-file> [<carrier>]` | 可重复配置，每项使用独立密钥，可指定传输方式和配额。配置 profile 时省略顶层的 `secret_file` 和 `carrier`。 |
-| `limits { … }` | 当前模块实例的配额。数值使用整数，大小以字节计。profile 继承省略项，并共用实例级配额。参见[上游容量参数](https://github.com/telegramdesktop/tproxy-server/blob/c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8/README.md#capacity-limits)。 |
+| `limits { … }` | 配额按服务域名分别计算。数值使用整数，大小以字节计。profile 继承省略项，同一域名下的 profile 共用该域名的配额。参见[上游容量参数](https://github.com/telegramdesktop/tproxy-server/blob/c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8/README.md#capacity-limits)。 |
 | `base_path <path>` | 将中继挂载到指定路径，例如 `/telegram`。客户端填 `proxy.example.com/telegram`。默认挂载在站点根路径。 |
 | `public_ip <IPv4>` | Caddy 经 NAT 出站时，填写 Telegram 看到的公网 IPv4。主机直接使用公网 IPv4 出站时可省略。 |
 | `token_key_file <path>` | 可选的 32 字节二进制签名密钥。默认按域名和挂载路径生成并保存在 Caddy 存储中。配置 Telegram 时填写客户端密钥。 |
@@ -79,7 +81,7 @@ tg://webproxy?server=proxy.example.com%2Ftelegram&secret=<marked-secret>
 
 ```caddyfile
 proxy.example.com {
-	tproxy proxy.example.com {
+	tproxy {
 		limits {
 			max_sessions_global 64
 			max_streams_global 1024

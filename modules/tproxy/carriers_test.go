@@ -32,7 +32,7 @@ func TestEarlyDataRejectedByEmbeddedHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(relay.Shutdown)
-	module := &Handler{relay: relay}
+	module := &Handler{hosts: map[string]*hostRelay{value.PublicHostname: {relay: relay}}}
 	fallback := caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 		w.WriteHeader(http.StatusAccepted)
 		return nil
@@ -127,7 +127,7 @@ func TestEmbeddedCarriersMediaRoundTrip(t *testing.T) {
 				time.Sleep(time.Millisecond)
 			}
 
-			module := &Handler{relay: relay}
+			module := &Handler{hosts: map[string]*hostRelay{hostname: {relay: relay}}}
 			fallback := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 				http.NotFound(w, r)
 				return nil
