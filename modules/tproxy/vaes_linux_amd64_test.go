@@ -12,9 +12,10 @@ import (
 )
 
 func TestVAESGuardPages(t *testing.T) {
-	if !useVAES {
-		t.Skip("VAES unavailable")
-	}
+	testVAESWidths(t, testVAESGuardPages)
+}
+
+func testVAESGuardPages(t *testing.T, wide bool) {
 	page := unix.Getpagesize()
 	srcPage, dstPage := guardedPage(t, page), guardedPage(t, page)
 	key, iv := [32]byte{1, 2, 3, 4}, [aes.BlockSize]byte{5, 6, 7, 8}
@@ -30,10 +31,10 @@ func TestVAESGuardPages(t *testing.T) {
 	}{
 		{"CTR", []int{vaesBatch - 1, vaesBatch, vaesBatch + 1, page},
 			func() func([]byte, []byte) { return standardCTR(key, iv).XORKeyStream },
-			func() func([]byte, []byte) { return newVAESCTR(key, iv).XORKeyStream }},
-		{"CBC", []int{vaesBatch - aes.BlockSize, vaesBatch, vaesBatch + aes.BlockSize, page},
+			func() func([]byte, []byte) { return newVAESCTR(key, iv, wide).XORKeyStream }},
+		{"CBC", []int{48, 64, 80, 128, 192, vaesBatch - aes.BlockSize, vaesBatch, vaesBatch + aes.BlockSize, page},
 			func() func([]byte, []byte) { return cipher.NewCBCDecrypter(block, iv[:]).CryptBlocks },
-			func() func([]byte, []byte) { return newVAESCBCDecrypter(key, iv).CryptBlocks }},
+			func() func([]byte, []byte) { return newVAESCBCDecrypter(key, iv, wide).CryptBlocks }},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
 			for _, size := range mode.sizes {

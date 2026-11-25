@@ -78,7 +78,7 @@ GLOBL counterStep<>(SB), RODATA|NOPTR, $16
 
 // Each YMM register carries two AES blocks. Keep eight independent vectors in
 // flight and broadcast each round key to both lanes.
-#define ROUND(op, key, pos) \
+#define ROUND(op, key, pos, register) \
 	VBROADCASTI128 pos(key), Y8; \
 	op Y8, Y0, Y0; \
 	op Y8, Y1, Y1; \
@@ -89,22 +89,22 @@ GLOBL counterStep<>(SB), RODATA|NOPTR, $16
 	op Y8, Y6, Y6; \
 	op Y8, Y7, Y7
 
-#define ROUNDS(op, last, key) \
-	ROUND(VPXOR, key, 0); \
-	ROUND(op, key, 16); \
-	ROUND(op, key, 32); \
-	ROUND(op, key, 48); \
-	ROUND(op, key, 64); \
-	ROUND(op, key, 80); \
-	ROUND(op, key, 96); \
-	ROUND(op, key, 112); \
-	ROUND(op, key, 128); \
-	ROUND(op, key, 144); \
-	ROUND(op, key, 160); \
-	ROUND(op, key, 176); \
-	ROUND(op, key, 192); \
-	ROUND(op, key, 208); \
-	ROUND(last, key, 224)
+#define ROUNDS(round, xor, op, last, key) \
+	round(xor, key, 0, Z16); \
+	round(op, key, 16, Z17); \
+	round(op, key, 32, Z18); \
+	round(op, key, 48, Z19); \
+	round(op, key, 64, Z20); \
+	round(op, key, 80, Z21); \
+	round(op, key, 96, Z22); \
+	round(op, key, 112, Z23); \
+	round(op, key, 128, Z24); \
+	round(op, key, 144, Z25); \
+	round(op, key, 160, Z26); \
+	round(op, key, 176, Z27); \
+	round(op, key, 192, Z28); \
+	round(op, key, 208, Z29); \
+	round(last, key, 224, Z30)
 
 #define NEXT_COUNTER(dst) \
 	VPSHUFB Y10, Y9, dst; \
@@ -133,7 +133,7 @@ ctr:
 	NEXT_COUNTER(Y5)
 	NEXT_COUNTER(Y6)
 	NEXT_COUNTER(Y7)
-	ROUNDS(VAESENC, VAESENCLAST, AX)
+	ROUNDS(ROUND, VPXOR, VAESENC, VAESENCLAST, AX)
 	XOR_STORE(SI, DI, Y0, 0)
 	XOR_STORE(SI, DI, Y1, 32)
 	XOR_STORE(SI, DI, Y2, 64)
@@ -173,7 +173,7 @@ cbc:
 	VMOVDQU 160(SI), Y5
 	VMOVDQU 192(SI), Y6
 	VMOVDQU 224(SI), Y7
-	ROUNDS(VAESDEC, VAESDECLAST, AX)
+	ROUNDS(ROUND, VPXOR, VAESDEC, VAESDECLAST, AX)
 	CBC_STORE(Y7, 208, 224)
 	CBC_STORE(Y6, 176, 192)
 	CBC_STORE(Y5, 144, 160)
@@ -189,5 +189,127 @@ cbc:
 	SUBQ $256, CX
 	JNZ cbc
 	VMOVDQU X10, (DX)
+	VZEROUPPER
+	RET
+
+DATA counterLanes512<>+24(SB)/8, $1
+DATA counterLanes512<>+40(SB)/8, $2
+DATA counterLanes512<>+56(SB)/8, $3
+GLOBL counterLanes512<>(SB), RODATA|NOPTR, $64
+
+DATA counterStep512<>+8(SB)/8, $4
+GLOBL counterStep512<>(SB), RODATA|NOPTR, $16
+
+// Broadcast each round key once per call. Four ZMM registers then hold the
+// same sixteen AES blocks as a YMM batch without reloading round keys.
+#define BROADCAST_ROUND512(load, key, pos, register) \
+	load pos(key), register
+
+#define LOAD_ROUNDS512(key) \
+	ROUNDS(BROADCAST_ROUND512, VBROADCASTI32X4, VBROADCASTI32X4, VBROADCASTI32X4, key)
+
+#define ROUND512(op, key, pos, register) \
+	op register, Z0, Z0; \
+	op register, Z1, Z1; \
+	op register, Z2, Z2; \
+	op register, Z3, Z3
+
+#define ROUND512_SINGLE(op, key, pos, register) \
+	op register, Z0, Z0
+
+#define XOR_STORE512(vector, offset) \
+	VPXORQ offset(SI), vector, vector; \
+	VMOVDQU64 vector, offset(DI)
+
+// size is a positive multiple of 256. The caller excludes counter carry.
+TEXT ·xorVAESCTR512(SB), NOSPLIT, $0-40
+	MOVQ rounds+0(FP), AX
+	MOVQ dst+8(FP), DI
+	MOVQ src+16(FP), SI
+	MOVQ size+24(FP), CX
+	MOVQ counters+32(FP), DX
+	VBROADCASTI32X4 (DX), Z9
+	VPADDQ counterLanes512<>(SB), Z9, Z9
+	VBROADCASTI32X4 reverseQwords<>(SB), Z10
+	VBROADCASTI32X4 counterStep512<>(SB), Z11
+	VPADDQ Z11, Z11, Z12
+	VPADDQ Z11, Z12, Z13
+	VPADDQ Z12, Z12, Z14
+	LOAD_ROUNDS512(AX)
+ctr512:
+	// Form all four counter vectors from the same base counter.
+	VPADDQ Z11, Z9, Z1
+	VPADDQ Z12, Z9, Z2
+	VPADDQ Z13, Z9, Z3
+	VPSHUFB Z10, Z9, Z0
+	VPSHUFB Z10, Z1, Z1
+	VPSHUFB Z10, Z2, Z2
+	VPSHUFB Z10, Z3, Z3
+	VPADDQ Z14, Z9, Z9
+	ROUNDS(ROUND512, VPXORQ, VAESENC, VAESENCLAST, AX)
+	XOR_STORE512(Z0, 0)
+	XOR_STORE512(Z1, 64)
+	XOR_STORE512(Z2, 128)
+	XOR_STORE512(Z3, 192)
+	ADDQ $256, SI
+	ADDQ $256, DI
+	SUBQ $256, CX
+	JNZ ctr512
+	VZEROUPPER
+	RET
+
+// size is a positive multiple of 64.
+TEXT ·decryptVAESCBC512(SB), NOSPLIT, $0-40
+	MOVQ rounds+0(FP), AX
+	MOVQ dst+8(FP), DI
+	MOVQ src+16(FP), SI
+	MOVQ size+24(FP), CX
+	MOVQ iv+32(FP), DX
+	VPXORQ Z10, Z10, Z10
+	VINSERTI32X4 $3, (DX), Z10, Z10
+	LOAD_ROUNDS512(AX)
+	CMPQ CX, $256
+	JB cbc512tail
+cbc512:
+	VMOVDQU64 (SI), Z0
+	VMOVDQU64 64(SI), Z1
+	VMOVDQU64 128(SI), Z2
+	VMOVDQU64 192(SI), Z3
+	// Save the preceding ciphertext for each block before any in-place stores.
+	VALIGNQ $6, Z10, Z0, Z11
+	VALIGNQ $6, Z0, Z1, Z12
+	VALIGNQ $6, Z1, Z2, Z13
+	VALIGNQ $6, Z2, Z3, Z14
+	VMOVDQA64 Z3, Z10
+	ROUNDS(ROUND512, VPXORQ, VAESDEC, VAESDECLAST, AX)
+	VPXORQ Z11, Z0, Z0
+	VPXORQ Z12, Z1, Z1
+	VPXORQ Z13, Z2, Z2
+	VPXORQ Z14, Z3, Z3
+	VMOVDQU64 Z0, (DI)
+	VMOVDQU64 Z1, 64(DI)
+	VMOVDQU64 Z2, 128(DI)
+	VMOVDQU64 Z3, 192(DI)
+	ADDQ $256, SI
+	ADDQ $256, DI
+	SUBQ $256, CX
+	CMPQ CX, $256
+	JAE cbc512
+cbc512tail:
+	TESTQ CX, CX
+	JE cbc512done
+cbc512group:
+	VMOVDQU64 (SI), Z0
+	VALIGNQ $6, Z10, Z0, Z11
+	VMOVDQA64 Z0, Z10
+	ROUNDS(ROUND512_SINGLE, VPXORQ, VAESDEC, VAESDECLAST, AX)
+	VPXORQ Z11, Z0, Z0
+	VMOVDQU64 Z0, (DI)
+	ADDQ $64, SI
+	ADDQ $64, DI
+	SUBQ $64, CX
+	JNZ cbc512group
+cbc512done:
+	VEXTRACTI32X4 $3, Z10, (DX)
 	VZEROUPPER
 	RET

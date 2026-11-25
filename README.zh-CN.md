@@ -142,7 +142,7 @@ Caddy 在 TLS 握手前解析 PROXY 头，并使用传入的客户端地址计�
 
 在 Caddy 全局选项中启用 `metrics`，然后抓取管理端点，或在内网监控站点添加 `metrics /metrics`。可关注 `caddy_tproxy_*` 指标中的 `sessions`、`streams`、`pending_bytes`、`limit_hits_total` 和 `rpc_dial_failures_total`。`handshakes_rejected_total` 同时统计重复握手和窗口满额时被拒绝的握手。[Caddy 监控文档](https://caddyserver.com/docs/caddyfile/directives/metrics)
 
-`max_pending_global` 覆盖中继队列、正在读取的载体请求体和后端数据包缓冲。后端缓冲另有 64 MiB 上限。进程共用的空闲请求体缓冲缓存最多占用 7 MiB，空闲后端大包缓存另占最多 4 MiB + 2 KiB。进程实际内存还包括 TLS、套接字和 Go 运行时开销。调低队列上限时，要为控制帧、一个上行批次和下行 DATA 帧留出空间。Caddy 会拒绝没有为下行 DATA 帧留空间的配置。在支持 VAES 和 AVX2 的 x86-64 主机上，后端会自动加速 AES-256-CTR 和 RPC 的 AES-256-CBC 解密。
+`max_pending_global` 覆盖中继队列、正在读取的载体请求体和后端数据包缓冲。后端缓冲另有 64 MiB 上限。进程共用的空闲请求体缓冲缓存最多占用 7 MiB，空闲后端大包缓存另占最多 4 MiB + 2 KiB。进程实际内存还包括 TLS、套接字和 Go 运行时开销。调低队列上限时，要为控制帧、一个上行批次和下行 DATA 帧留出空间。Caddy 会拒绝没有为下行 DATA 帧留空间的配置。在 x86-64 主机上，后端对 AES-256-CTR 和 RPC 的 AES-256-CBC 解密优先使用 512 位 VAES，其次在支持 AVX2 和 VAES 时使用 256 位 VAES，否则使用 Go 标准库的 AES 实现。
 
 ## 开发
 

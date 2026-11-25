@@ -15,14 +15,25 @@ import (
 	"golang.org/x/sys/cpu"
 )
 
-const vaesBatch = 16 * aes.BlockSize
+const (
+	vaesBatch       = 16 * aes.BlockSize
+	vaes512CBCGroup = 4 * aes.BlockSize
+)
 
-var useVAES = cpu.X86.HasAES && cpu.X86.HasAVX2 && cpuHasVAES() && !fips140.Enabled()
+var (
+	allowVAES  = cpu.X86.HasAES && !fips140.Enabled()
+	useVAES256 = allowVAES && cpu.X86.HasAVX && cpu.X86.HasAVX2 && cpuHasVAES()
+	useVAES512 = allowVAES && cpu.X86.HasAVX && cpu.X86.HasAVX512 && cpu.X86.HasAVX512F && cpu.X86.HasAVX512BW && cpu.X86.HasAVX512VAES
+)
 
 func init() {
-	if useVAES {
-		newTransportCTR = newVAESCTR
-		newRPCDecrypter = newVAESCBCDecrypter
+	if useVAES512 || useVAES256 {
+		newTransportCTR = func(key [32]byte, iv [aes.BlockSize]byte) cipher.Stream {
+			return newVAESCTR(key, iv, useVAES512)
+		}
+		newRPCDecrypter = func(key [32]byte, iv [aes.BlockSize]byte) cipher.BlockMode {
+			return newVAESCBCDecrypter(key, iv, useVAES512)
+		}
 	}
 }
 
@@ -40,7 +51,13 @@ func invertAES256(rounds *aes256RoundKeys)
 func xorVAESCTR(rounds *aes256RoundKeys, dst, src *byte, size int, counters *[4]uint64)
 
 //go:noescape
+func xorVAESCTR512(rounds *aes256RoundKeys, dst, src *byte, size int, counters *[4]uint64)
+
+//go:noescape
 func decryptVAESCBC(rounds *aes256RoundKeys, dst, src *byte, size int, iv *[aes.BlockSize]byte)
+
+//go:noescape
+func decryptVAESCBC512(rounds *aes256RoundKeys, dst, src *byte, size int, iv *[aes.BlockSize]byte)
 
 var zeroVAESBatch [vaesBatch]byte
 
@@ -50,12 +67,14 @@ type vaesCTR struct {
 	low    uint64
 	spare  [vaesBatch]byte
 	unused int
+	wide   bool
 }
 
-func newVAESCTR(key [32]byte, iv [aes.BlockSize]byte) cipher.Stream {
+func newVAESCTR(key [32]byte, iv [aes.BlockSize]byte, wide bool) cipher.Stream {
 	c := &vaesCTR{
 		high: binary.BigEndian.Uint64(iv[:8]),
 		low:  binary.BigEndian.Uint64(iv[8:]),
+		wide: wide,
 	}
 	expandAES256(&key, &c.rounds)
 	return c
@@ -82,8 +101,7 @@ func (c *vaesCTR) XORKeyStream(dst, src []byte) {
 		blocks := min(uint64(len(src)/aes.BlockSize), math.MaxUint64-c.low)
 		size := int(blocks) * aes.BlockSize &^ (vaesBatch - 1)
 		if size != 0 {
-			counters := [4]uint64{c.high, c.low, c.high, c.low + 1}
-			xorVAESCTR(&c.rounds, &dst[0], &src[0], size, &counters)
+			c.xorBatches(dst, src, size)
 			c.low += uint64(size / aes.BlockSize)
 			dst, src = dst[size:], src[size:]
 			continue
@@ -92,10 +110,18 @@ func (c *vaesCTR) XORKeyStream(dst, src []byte) {
 	}
 }
 
+func (c *vaesCTR) xorBatches(dst, src []byte, size int) {
+	counters := [4]uint64{c.high, c.low, c.high, c.low + 1}
+	if c.wide {
+		xorVAESCTR512(&c.rounds, &dst[0], &src[0], size, &counters)
+	} else {
+		xorVAESCTR(&c.rounds, &dst[0], &src[0], size, &counters)
+	}
+}
+
 func (c *vaesCTR) refill() {
 	if c.low <= math.MaxUint64-vaesBatch/aes.BlockSize {
-		counters := [4]uint64{c.high, c.low, c.high, c.low + 1}
-		xorVAESCTR(&c.rounds, &c.spare[0], &zeroVAESBatch[0], vaesBatch, &counters)
+		c.xorBatches(c.spare[:], zeroVAESBatch[:], vaesBatch)
 	} else {
 		// The first two round keys are the original AES-256 key. Use the
 		// standard library for the rare batch that crosses a 64-bit wrap.
@@ -123,15 +149,16 @@ type vaesCBC struct {
 	iv       [aes.BlockSize]byte
 	fallback cbcDecrypterWithIV
 	needsIV  bool
+	wide     bool
 }
 
-func newVAESCBCDecrypter(key [32]byte, iv [aes.BlockSize]byte) cipher.BlockMode {
+func newVAESCBCDecrypter(key [32]byte, iv [aes.BlockSize]byte, wide bool) cipher.BlockMode {
 	decrypt := standardCBCDecrypter(key, iv)
 	fallback, ok := decrypt.(cbcDecrypterWithIV)
 	if !ok {
 		return decrypt
 	}
-	c := &vaesCBC{iv: iv, fallback: fallback}
+	c := &vaesCBC{iv: iv, fallback: fallback, wide: wide}
 	expandAES256(&key, &c.rounds)
 	invertAES256(&c.rounds)
 	return c
@@ -147,8 +174,16 @@ func (c *vaesCBC) CryptBlocks(dst, src []byte) {
 	if inexactOverlap(dst, src) {
 		panic("AES-CBC input and output overlap")
 	}
-	if size := len(src) &^ (vaesBatch - 1); size != 0 {
-		decryptVAESCBC(&c.rounds, &dst[0], &src[0], size, &c.iv)
+	size := len(src) &^ (vaesBatch - 1)
+	if c.wide {
+		size = len(src) &^ (vaes512CBCGroup - 1)
+	}
+	if size != 0 {
+		if c.wide {
+			decryptVAESCBC512(&c.rounds, &dst[0], &src[0], size, &c.iv)
+		} else {
+			decryptVAESCBC(&c.rounds, &dst[0], &src[0], size, &c.iv)
+		}
 		c.needsIV = true
 		dst, src = dst[size:], src[size:]
 	}

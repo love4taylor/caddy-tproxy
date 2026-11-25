@@ -11,10 +11,53 @@ import (
 	"testing"
 )
 
-func TestVAESCTRMatchesStandard(t *testing.T) {
-	if !useVAES {
+func testVAESWidths(t *testing.T, test func(*testing.T, bool)) {
+	t.Helper()
+	if !useVAES256 && !useVAES512 {
 		t.Skip("VAES unavailable")
 	}
+	if useVAES256 {
+		t.Run("256", func(t *testing.T) { test(t, false) })
+	}
+	if useVAES512 {
+		t.Run("512", func(t *testing.T) { test(t, true) })
+	}
+}
+
+func TestVAESDispatch(t *testing.T) {
+	key, iv := [32]byte{1}, [aes.BlockSize]byte{2}
+	stream := newTransportCTR(key, iv)
+	decrypt := newRPCDecrypter(key, iv)
+	ctr, ctrOK := stream.(*vaesCTR)
+	cbc, cbcOK := decrypt.(*vaesCBC)
+	accelerated := useVAES512 || useVAES256
+	if ctrOK != accelerated || cbcOK != accelerated {
+		t.Fatalf("unexpected CTR or CBC implementation: %T, %T", stream, decrypt)
+	}
+	if accelerated {
+		if ctr.wide != useVAES512 || cbc.wide != useVAES512 {
+			t.Fatalf("unexpected VAES width: CTR wide=%t, CBC wide=%t", ctr.wide, cbc.wide)
+		}
+		if useVAES512 {
+			t.Log("using VAES-512")
+		} else {
+			t.Log("using VAES-256")
+		}
+	} else {
+		t.Log("using standard AES")
+	}
+
+	// Execute both implementations through the normal constructors.
+	var buf [vaesBatch]byte
+	stream.XORKeyStream(buf[:], buf[:])
+	decrypt.CryptBlocks(buf[:], buf[:])
+}
+
+func TestVAESCTRMatchesStandard(t *testing.T) {
+	testVAESWidths(t, testVAESCTRMatchesStandard)
+}
+
+func testVAESCTRMatchesStandard(t *testing.T, wide bool) {
 	var key [32]byte
 	for i := range key {
 		key[i] = byte(i*7 + 11)
@@ -31,10 +74,7 @@ func TestVAESCTRMatchesStandard(t *testing.T) {
 		standardCTR(key, iv).XORKeyStream(want, plain)
 		for _, chunks := range [][]int{{8195}, {1, 0, 15, 41, 1024, 3, 4096}, {256, 256, 32, 255, 257, 4096}} {
 			for _, inPlace := range []bool{false, true} {
-				stream := newVAESCTR(key, iv)
-				if _, ok := stream.(*vaesCTR); !ok {
-					t.Fatal("CTR VAES path was not selected")
-				}
+				stream := newVAESCTR(key, iv, wide)
 				got := make([]byte, len(plain))
 				src := plain
 				if inPlace {
@@ -56,9 +96,10 @@ func TestVAESCTRMatchesStandard(t *testing.T) {
 }
 
 func TestVAESCBCMatchesStandard(t *testing.T) {
-	if !useVAES {
-		t.Skip("VAES unavailable")
-	}
+	testVAESWidths(t, testVAESCBCMatchesStandard)
+}
+
+func testVAESCBCMatchesStandard(t *testing.T, wide bool) {
 	var key [32]byte
 	var iv [16]byte
 	for i := range key {
@@ -74,9 +115,9 @@ func TestVAESCBCMatchesStandard(t *testing.T) {
 	block, _ := aes.NewCipher(key[:])
 	encrypted := make([]byte, len(plain))
 	cipher.NewCBCEncrypter(block, iv[:]).CryptBlocks(encrypted, plain)
-	for _, chunks := range [][]int{{8192}, {0, 16, 240, 256, 272, 4096, 32}} {
+	for _, chunks := range [][]int{{8192}, {0, 16, 48, 64, 80, 128, 192, 240, 256, 272, 4096, 32}} {
 		for _, inPlace := range []bool{false, true} {
-			decrypt := newVAESCBCDecrypter(key, iv)
+			decrypt := newVAESCBCDecrypter(key, iv, wide)
 			if _, ok := decrypt.(*vaesCBC); !ok {
 				t.Fatal("CBC VAES path was not selected")
 			}
@@ -101,34 +142,37 @@ func TestVAESCBCMatchesStandard(t *testing.T) {
 
 func BenchmarkMTProxyAES(b *testing.B) {
 	for _, mode := range []string{"CTR", "CBCDecrypt"} {
-		for _, size := range []int{64, 1024, 16 << 10, 64 << 10} {
+		for _, size := range []int{64, 128, 192, 256, 1024, 4096, 16 << 10, 64 << 10} {
 			b.Run(mode+"/"+strconv.Itoa(size), func(b *testing.B) {
-				b.Run("Standard", func(b *testing.B) { benchmarkAES(b, mode, size, false) })
-				if useVAES {
-					b.Run("VAES", func(b *testing.B) { benchmarkAES(b, mode, size, true) })
+				b.Run("Standard", func(b *testing.B) { benchmarkAES(b, mode, size, false, false) })
+				if useVAES256 {
+					b.Run("VAES256", func(b *testing.B) { benchmarkAES(b, mode, size, true, false) })
+				}
+				if useVAES512 {
+					b.Run("VAES512", func(b *testing.B) { benchmarkAES(b, mode, size, true, true) })
 				}
 			})
 		}
 	}
 }
 
-func benchmarkAES(b *testing.B, mode string, size int, accelerated bool) {
+func benchmarkAES(b *testing.B, mode string, size int, accelerated, wide bool) {
 	key := [32]byte{1}
 	iv := [16]byte{2}
 	data := make([]byte, size)
 	var crypt func([]byte, []byte)
 	if mode == "CTR" {
-		newCTR := standardCTR
 		if accelerated {
-			newCTR = newVAESCTR
+			crypt = newVAESCTR(key, iv, wide).XORKeyStream
+		} else {
+			crypt = standardCTR(key, iv).XORKeyStream
 		}
-		crypt = newCTR(key, iv).XORKeyStream
 	} else {
-		newCBC := standardCBCDecrypter
 		if accelerated {
-			newCBC = newVAESCBCDecrypter
+			crypt = newVAESCBCDecrypter(key, iv, wide).CryptBlocks
+		} else {
+			crypt = standardCBCDecrypter(key, iv).CryptBlocks
 		}
-		crypt = newCBC(key, iv).CryptBlocks
 	}
 	b.SetBytes(int64(size))
 	b.ReportAllocs()
